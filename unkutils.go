@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -184,18 +185,24 @@ func leUint64(b []byte) uint64 {
 	return v
 }
 
-// Constraints on what may be called an achievement list. Swept across every
-// response in two 3.2.0 captures these admit exactly the two real packets.
+// Constraints on what may be called an achievement list.
 //
-// The ratio is strict on purpose: a 37-entry list matched at 81% and a 117-entry
-// one at 97%, so below-certainty is not evidence. The cost is that a patch adding
-// achievements before stardb updates stops detection rather than returning a
-// partial answer, which is the safer failure.
+// The entry floor is strict on purpose: a 37-entry list matched at 81% and a
+// 117-entry one at 97%, so a near match on a short list is not evidence.
 const (
 	minAchievementEntries = 40
+	// entriesPerUnknownID is how many entries a list must have per id the
+	// catalogue does not know. The game can ship an achievement before stardb
+	// lists it, and requiring every id to be known would then throw the whole
+	// list away over a single entry. One unknown per hundred lets that through
+	// while the 117-entry false positive above, at roughly four unknowns, still
+	// fails.
+	entriesPerUnknownID = 100
 	// Constants in the descriptor table are all small; unconstrained voting
 	// returns arbitrary large ones such as 10773171, which are always spurious.
-	maxXorKey      = 1 << 16
+	maxXorKey = 1 << 16
+	// Where the lists sit changes between builds, so the bound is generous
+	// rather than tight.
 	maxDetectDepth = 6
 )
 
@@ -209,17 +216,15 @@ type achievementList struct {
 	IDs     []uint32
 	// Arcade is true when every id is an arcade id, which separates the two packets.
 	Arcade bool
-	// Matched counts ids that resolved to a catalogue entry. Detection requires
-	// it to equal Entries: a 37-entry list matched at 81% and a 117-entry one at
-	// 97%, so anything below certainty is not evidence. The cost is that a patch
-	// adding achievements before stardb updates stops detection rather than
-	// returning a partial answer, which is the safer failure.
+	// Matched counts ids that resolved to a catalogue entry. Detection allows
+	// at most maxUnknownIDs(Entries) short of Entries, for achievements stardb
+	// has not listed yet.
 	Matched int
 }
 
 var errNoAchievements = errors.New("no achievement list found")
 
-// PathString renders the tag chain for logs, e.g. "f15.f1067.f10".
+// PathString renders the tag chain for logs, e.g. "f1.f2.f3".
 func (d *achievementList) PathString() string {
 	s := ""
 	for _, tag := range d.Path {
@@ -229,9 +234,9 @@ func (d *achievementList) PathString() string {
 }
 
 // unkAchievementList searches an unknown message for an achievement list. Both
-// ZZZ lists are repeated submessages inside a larger response, the regular one
-// three levels down (GetMiscDataScRsp.15 -> 1067 -> 10). The walk descends
-// through single occurrences too, so the deep one is reached.
+// ZZZ lists are repeated submessages inside a larger response, at a depth and
+// under tags that change between builds. The walk descends through single
+// occurrences too, so a list nested several levels down is still reached.
 func unkAchievementList(data []byte, cat *achievementCatalogue) (*achievementList, error) {
 	var best *achievementList
 
@@ -306,8 +311,8 @@ func checkAchievementList(elems [][]byte, cat *achievementCatalogue) *achievemen
 		if len(observed) < minAchievementEntries {
 			continue
 		}
-		key, matched := bestXorKey(observed, cat.All)
-		if matched < len(observed) || key >= maxXorKey {
+		key, matched, ok := findXorKey(observed, cat.All)
+		if !ok {
 			continue
 		}
 
@@ -318,7 +323,9 @@ func checkAchievementList(elems [][]byte, cat *achievementCatalogue) *achievemen
 			id := uint32(v ^ key)
 			ids[i] = id
 			seen[id] = true
-			if !cat.Arcade[id] {
+			// Judged on the known ids only, so that an arcade achievement stardb
+			// has not listed yet does not make the arcade list look regular.
+			if cat.All[id] && !cat.Arcade[id] {
 				allArcade = false
 			}
 		}
@@ -343,37 +350,62 @@ func checkAchievementList(elems [][]byte, cat *achievementCatalogue) *achievemen
 	return best
 }
 
-// bestXorKey recovers the constant applied to a set of observed values.
+func maxUnknownIDs(entries int) int {
+	return entries / entriesPerUnknownID
+}
+
+// findXorKey recovers the constant applied to a set of observed values: the key
+// below maxXorKey that maps all of them onto catalogue ids, bar the few
+// maxUnknownIDs allows. It returns the key and how many values it matched.
 //
-// Vote rather than search the 32-bit space: every (observed, catalogue) pair
-// implies one candidate key, so the true key collects a vote per entry. Candidates
-// are then scored on actual matches rather than votes, because the catalogue is
-// dense enough to give low-bit keys spurious votes -- key 4 matches 57 of 65
-// entries while key 0 matches all 65.
-func bestXorKey(observed []uint64, idset map[uint32]bool) (uint64, int) {
-	votes := map[uint64]int{}
-	for _, v := range observed {
+// With at most k values off the catalogue, one of the first k+1 lands on an id,
+// so those alone narrow the candidates to k+1 per id, and each is then checked
+// against the rest. That is linear in the list, where voting over every
+// (observed, id) pair and scoring each vote was quadratic: seconds per packet on
+// an 800-entry list.
+//
+// Among keys that fit, the one with the most matches and then the most distinct
+// ids wins, because the catalogue is dense enough that low-bit keys come close
+// -- key 4 matches 57 of 65 entries while key 0 matches all 65.
+func findXorKey(observed []uint64, idset map[uint32]bool) (uint64, int, bool) {
+	allowed := maxUnknownIDs(len(observed))
+	candidates := map[uint64]bool{}
+	for i := 0; i <= allowed && i < len(observed); i++ {
 		for id := range idset {
-			votes[v^uint64(id)]++
+			if key := observed[i] ^ uint64(id); key < maxXorKey {
+				candidates[key] = true
+			}
 		}
 	}
+	// Sorted so that a tie goes the same way on every run.
+	keys := make([]uint64, 0, len(candidates))
+	for key := range candidates {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
 	var bestKey uint64
 	bestGood, bestDistinct := -1, -1
-	for key := range votes {
-		good := 0
+	for _, key := range keys {
+		good, unknown := 0, 0
 		seen := map[uint32]bool{}
 		for _, v := range observed {
-			if idset[uint32(v^key)] {
+			id := uint32(v ^ key)
+			seen[id] = true
+			if idset[id] {
 				good++
-				seen[uint32(v^key)] = true
+			} else if unknown++; unknown > allowed {
+				break
 			}
+		}
+		if unknown > allowed {
+			continue
 		}
 		if good > bestGood || (good == bestGood && len(seen) > bestDistinct) {
 			bestKey, bestGood, bestDistinct = key, good, len(seen)
 		}
 	}
-	return bestKey, bestGood
+	return bestKey, bestGood, bestGood >= 0
 }
 
 // Generated names. Even the leaf names are ours; neither message appears in the
