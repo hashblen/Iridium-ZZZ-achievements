@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/jhump/protoreflect/dynamic"
 )
 
 func writeProto(protoName string, fields map[int32]string, additional string, prefix string) {
@@ -220,6 +221,9 @@ type achievementList struct {
 	// at most maxUnknownIDs(Entries) short of Entries, for achievements stardb
 	// has not listed yet.
 	Matched int
+	// Finished counts earned achievements, reward claimed or not; Unclaimed is
+	// the part of those whose reward is still waiting. See countFinished.
+	Finished, Unclaimed int
 }
 
 var errNoAchievements = errors.New("no achievement list found")
@@ -292,11 +296,13 @@ func betterList(a, b *achievementList) bool {
 
 func checkAchievementList(elems [][]byte, cat *achievementCatalogue) *achievementList {
 	vals := map[int32][]uint64{}
+	msgs := make([]*dynamic.Message, 0, len(elems))
 	for _, e := range elems {
 		dMsg, err := parseUnkProto(e)
 		if err != nil {
 			return nil
 		}
+		msgs = append(msgs, dMsg)
 		for _, tag := range dMsg.GetUnknownFields() {
 			for _, f := range dMsg.GetUnknownField(tag) {
 				if f.Encoding == proto.WireVarint {
@@ -347,7 +353,59 @@ func checkAchievementList(elems [][]byte, cat *achievementCatalogue) *achievemen
 			best = cand
 		}
 	}
+	if best != nil {
+		best.Finished, best.Unclaimed = countFinished(msgs, best.Arcade)
+	}
 	return best
+}
+
+// Element tags for completion. Unlike the id tag these have held across builds,
+// so they are fixed rather than searched for.
+const (
+	// regularFinishTimeTag is set once the achievement is finished, reward
+	// claimed or not.
+	regularFinishTimeTag = 3
+	// regularClaimedTag is only set once the reward is taken, so an achievement
+	// finished but not yet claimed has the finish time alone.
+	regularClaimedTag = 4
+	// arcadeStatusTag is a status rather than a flag: arcadeStatusFinished once
+	// earned, arcadeStatusClaimed once the reward is taken, absent before. The
+	// arcade list's "unlocked" is set on every entry, so it says nothing.
+	arcadeStatusTag      = 15
+	arcadeStatusFinished = 1
+	arcadeStatusClaimed  = 2
+)
+
+// countFinished counts the earned achievements in a list, and the part of
+// those whose reward is still waiting.
+func countFinished(elems []*dynamic.Message, arcade bool) (finished, unclaimed int) {
+	for _, m := range elems {
+		var timed, claimed bool
+		for _, tag := range m.GetUnknownFields() {
+			for _, f := range m.GetUnknownField(tag) {
+				if f.Encoding != proto.WireVarint || f.Value == 0 {
+					continue
+				}
+				switch {
+				case arcade && tag == arcadeStatusTag:
+					// Anything past "finished" is taken as claimed.
+					timed = true
+					claimed = f.Value >= arcadeStatusClaimed
+				case !arcade && tag == regularFinishTimeTag:
+					timed = true
+				case !arcade && tag == regularClaimedTag:
+					claimed = true
+				}
+			}
+		}
+		if timed || claimed {
+			finished++
+		}
+		if timed && !claimed {
+			unclaimed++
+		}
+	}
+	return finished, unclaimed
 }
 
 func maxUnknownIDs(entries int) int {
@@ -429,20 +487,22 @@ func idDecl(key uint64) string {
 
 func writeAchievementProtos(list *achievementList) string {
 	elem, holder, outer := regularElem, regularHolder, "GetMiscDataScRsp"
+	// Tag 4 used to be called "finished", but it is only set once the reward is
+	// claimed: an achievement finished and not yet claimed has tag 3 alone.
 	fields := map[int32]string{
-		list.IDTag: idDecl(list.XORKey),
-		2:          "uint32 progress",
-		3:          "int64 unlock_time",
-		4:          "bool finished",
+		list.IDTag:           idDecl(list.XORKey),
+		2:                    "uint32 progress",
+		regularFinishTimeTag: "int64 finish_time",
+		regularClaimedTag:    "bool reward_claimed",
 	}
 	if list.Arcade {
 		elem, holder, outer = arcadeElem, arcadeHolder, "GetArcadeAchievementDataScRsp"
 		fields = map[int32]string{
-			list.IDTag: idDecl(list.XORKey),
-			2:          "uint32 group_id",
-			9:          "bool unlocked",
-			14:         "uint32 progress",
-			15:         "uint32 completed",
+			list.IDTag:      idDecl(list.XORKey),
+			2:               "uint32 group_id",
+			9:               "bool unlocked",
+			14:              "uint32 progress",
+			arcadeStatusTag: "uint32 status",
 		}
 	}
 

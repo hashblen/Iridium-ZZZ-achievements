@@ -182,6 +182,8 @@ func tryDetectAchievements(decrypted []byte, packetId uint16, cat *achievementCa
 	log.Printf("Detected %s achievement list in packet #%d: %s repeated x%d, "+
 		"id field f%d %s, %d distinct ids",
 		kind, packetId, list.PathString(), list.Entries, list.IDTag, key, len(list.IDs))
+	log.Printf("  %d finished, %d of them with the reward not yet claimed",
+		list.Finished, list.Unclaimed)
 
 	name := writeAchievementProtos(list)
 	LoadProto(name)
